@@ -1,0 +1,23 @@
+[project]
+name = "rosbag-to-ros2db3"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Rexyz", email = "2840722773@qq.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "rosbags>=0.11.9",
+]
+
+[project.scripts]
+bagcon = "rosbag_to_ros2db3:main"
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[build-system]
+requires = ["uv_build>=0.12.2,<0.13.0"]
+build-backend = "uv_build"
