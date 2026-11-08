@@ -33,12 +33,28 @@ bagcon drive.bag --all-types                      # 转 typestore 已知的全�
 | `--register TYPE=PATH` | 为自定义类型注册 `.msg` 定义，可重复 |
 | `--no-progress` | 关闭进度条，适合脚本和日志 |
 
-默认只转换 `sensor_msgs/msg/CompressedImage` 和 `sensor_msgs/msg/Imu`，其余话题会被跳过并
-打日志说明。
+默认只转换 `sensor_msgs/msg/CompressedImage`、`sensor_msgs/msg/Imu` 和
+`livox_ros_driver/msg/CustomMsg`，其余话题会被跳过并打日志说明。
 
 退出码：`0` 成功、`1` 转换失败、`2` 参数或路径有问题。
 
 转换是逐条流式写入的，内存占用与包大小无关，几 GB 的包也能转。
+
+## Livox 激光雷达
+
+ROS 2 的 Livox 驱动改名为 `livox_ros_driver2`，消息字段和 ROS 1 的 `livox_ros_driver` 完全一致，
+只差包名。所以包里 `livox_ros_driver/msg/CustomMsg` 的话题会被自动写成
+`livox_ros_driver2/msg/CustomMsg`，`timebase`、`point_num`、`lidar_id`、`rsvd` 以及每个点的
+`offset_time`/`x`/`y`/`z`/`reflectivity`/`tag`/`line` 都逐字节保持不变，ROS 2 里用
+`livox_ros_driver2` 的订阅者直接就能读：
+
+```bash
+bagcon hall01.bag -t /livox/lidar -o hall01_ros2
+```
+
+`livox_ros_driver2` 的 `.msg` 定义随包分发（`src/rosbag_to_ros2db3/msg/livox_ros_driver2/msg/`），
+不需要另外装驱动包，也不需要 `--register`。取 ROS 1 bag 里内嵌的定义反序列化，再按 ROS 2 的定义
+写 CDR，所以 `Header.seq` 会按格式差异丢掉，其余字段不变。
 
 ## 自定义消息类型
 
@@ -46,12 +62,14 @@ bagcon drive.bag --all-types                      # 转 typestore 已知的全�
 ROS 2 语法的 `.msg` 文件（字段类型在前、字段名在后）：
 
 ```bash
-bagcon livox.bag --all-types \
-  --register livox_ros_driver/msg/CustomMsg=msg/CustomMsg.msg \
-  --register livox_ros_driver/msg/CustomPoint=msg/CustomPoint.msg
+bagcon drive.bag --all-types \
+  --register my_ros1_pkg/msg/Foo=msg/Foo.msg \
+  --register my_ros1_pkg/msg/Bar=msg/Bar.msg
 ```
 
-依赖的标准消息类型（如 `std_msgs/Header`）由 typestore 提供，不需要重复注册。
+依赖的标准消息类型（如 `std_msgs/Header`）由 typestore 提供，不需要重复注册。类型名要和包里
+连接记录的类型名一致；如果输出的类型名和 ROS 1 里的不同（像 Livox 那样改名），用 ROS 2 侧的名字
+注册，转换时会按目标名字查定义。
 
 ## 已知限制
 
@@ -61,12 +79,3 @@ bagcon livox.bag --all-types \
 - ROS 1 的 `std_msgs/Header.seq` 在 ROS 2 里不存在，转换时会被丢弃，这是格式差异导致的。
 - ROS 1 bag 里没有 QoS 信息，输出话题的 `offered_qos_profiles` 为空，播放时按默认 QoS 处理。
 - 同一个话题上出现两种不同的消息类型属于异常数据，转换保留第一个类型并打警告。
-
-## 测试
-
-```bash
-uv sync --group dev
-uv run pytest
-```
-
-测试会自己构造 ROS 1 包、转换后再用 `AnyReader` 回读逐字段校验。

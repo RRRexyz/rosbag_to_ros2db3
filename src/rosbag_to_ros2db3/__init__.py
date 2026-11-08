@@ -9,37 +9,74 @@
 第 3 步不缓存消息，因此内存占用与包大小无关。写入过程中任何异常都会删除
 半成品输出目录，避免下一次运行被残留目录挡住，也避免留下"看起来正常、
 实际只有一半消息"的 bag。
+
+livox_ros_driver 只有 ROS 1 版本，对应的 ROS 2 驱动改名为 livox_ros_driver2，
+消息定义字段一致但类型名不同。包里遇到 ``livox_ros_driver/msg/CustomMsg`` 时
+会按 ``livox_ros_driver2/msg/CustomMsg`` 写出（定义随包分发，见 ``BUNDLED_TYPES``），
+这样 ROS 2 侧的 livox_ros_driver2 和配套 rviz 插件可以直接读。
 """
 
 # pyright: reportAttributeAccessIssue=false
 # pyright: reportArgumentType=false
+from __future__ import annotations
+
 import argparse
 import logging
 import shutil
 import sys
+from collections.abc import Collection, Iterable, Sequence
+from importlib.resources import files
 from pathlib import Path
+from typing import Any
 
 from rosbags.highlevel import AnyReader
+from rosbags.interfaces import Connection
 from rosbags.rosbag2 import Writer
 from rosbags.rosbag2.errors import WriterError
 from rosbags.typesys import Stores, TypesysError, get_types_from_msg, get_typestore
+from rosbags.typesys.store import Typestore
 from tqdm import tqdm
 
-LOGGER = logging.getLogger("bagcon")
+LOGGER: logging.Logger = logging.getLogger("bagcon")
+
+#: 消息类型名，形如 ``sensor_msgs/msg/Imu``。
+MsgType = str
+
+#: 一条消息的原始读数和元信息：(连接, 时间戳[ns], 序列化负载)。
+RawMessage = tuple[Connection, int, bytes]
+
+#: ROS 1 类型名 -> ROS 2 类型名。字段布局一致、只是包名不同的类型放这里。
+TYPE_ALIASES: dict[MsgType, MsgType] = {
+    # livox_ros_driver 没有 ROS 2 版本，ROS 2 驱动是 livox_ros_driver2
+    "livox_ros_driver/msg/CustomMsg": "livox_ros_driver2/msg/CustomMsg",
+}
+
+#: 随包分发的消息定义：(类型名, 包内路径片段)。按依赖顺序注册。
+BUNDLED_TYPES: tuple[tuple[MsgType, tuple[str, ...]], ...] = (
+    (
+        "livox_ros_driver2/msg/CustomPoint",
+        ("msg", "livox_ros_driver2", "msg", "CustomPoint.msg"),
+    ),
+    (
+        "livox_ros_driver2/msg/CustomMsg",
+        ("msg", "livox_ros_driver2", "msg", "CustomMsg.msg"),
+    ),
+)
 
 #: 默认转换的消息类型，用 ``--all-types`` 放开到 typestore 已知的全部类型。
-DEFAULT_TYPES = frozenset(
+DEFAULT_TYPES: frozenset[MsgType] = frozenset(
     {
         "sensor_msgs/msg/CompressedImage",
         "sensor_msgs/msg/Imu",
+        "livox_ros_driver/msg/CustomMsg",
     }
 )
 
 #: 读取 ROS 1 包时的兜底 typestore（包内未内嵌消息定义时使用）。
-ROS1_TYPESTORE = Stores.ROS1_NOETIC
+ROS1_TYPESTORE: Stores = Stores.ROS1_NOETIC
 
 #: ``--distro`` 取值到 rosbags typestore 的映射。
-DISTROS = {
+DISTROS: dict[str, Stores] = {
     "foxy": Stores.ROS2_FOXY,
     "galactic": Stores.ROS2_GALACTIC,
     "humble": Stores.ROS2_HUMBLE,
@@ -60,6 +97,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bagcon",
         description="Convert a ROS 1 bag into a ROS 2 (rosbag2/sqlite3) bag.",
+        epilog=(
+            "livox_ros_driver/msg/CustomMsg is written as "
+            "livox_ros_driver2/msg/CustomMsg, because the ROS 2 Livox driver "
+            "uses the livox_ros_driver2 package name."
+        ),
     )
     parser.add_argument("src", type=Path, help="path to the ROS 1 .bag file")
     parser.add_argument(
@@ -116,9 +158,11 @@ def default_output(src: Path) -> Path:
     return src.parent / f"{src.stem}_ros2"
 
 
-def register_types(store, specs: list[str]) -> None:
+def register_types(store: Typestore, specs: Iterable[str]) -> None:
     """把 ``--register TYPE=PATH`` 指定的自定义类型注册进 typestore。"""
     for spec in specs:
+        typename: str
+        file_arg: str
         typename, sep, file_arg = spec.partition("=")
         if not sep or not typename or not file_arg:
             raise ValueError(f"bad --register value {spec!r}, expected TYPE=PATH")
@@ -130,10 +174,26 @@ def register_types(store, specs: list[str]) -> None:
         LOGGER.info("registered %s from %s", typename, path)
 
 
-def select_connections(connections, types, topics):
-    """按消息类型与话题筛选连接，返回 (选中的连接, 被跳过的话题->类型)。"""
-    selected = []
-    skipped: dict[str, str] = {}
+def register_bundled_types(store: Typestore) -> None:
+    """注册随包分发的消息定义（目前是 livox_ros_driver2 的 CustomMsg/CustomPoint）。"""
+    package = __package__ or __name__
+    for typename, parts in BUNDLED_TYPES:
+        try:
+            text = files(package).joinpath(*parts).read_text(encoding="utf-8")
+        except OSError as exc:  # 定义文件缺失时不致命，后续按"类型未知"跳过
+            LOGGER.warning("bundled definition for %s is missing: %s", typename, exc)
+            continue
+        store.register(get_types_from_msg(text, typename))
+
+
+def select_connections(
+    connections: Iterable[Connection],
+    types: Collection[MsgType] | None,
+    topics: Collection[str] | None,
+) -> tuple[list[Connection], dict[str, MsgType]]:
+    """按消息类型与话题筛选连接，返回 (选中的连接, 被跳过的话题 -> 类型)。"""
+    selected: list[Connection] = []
+    skipped: dict[str, MsgType] = {}
     for conn in connections:
         if topics is not None and conn.topic not in topics:
             continue
@@ -144,12 +204,19 @@ def select_connections(connections, types, topics):
     return selected, skipped
 
 
-def resolve_connections(connections, ros2_store):
-    """丢掉 typestore 不认识的类型，以及同名但类型冲突的重复话题。"""
-    resolvable = []
+def resolve_connections(
+    connections: Iterable[Connection], ros2_store: Typestore
+) -> list[tuple[Connection, MsgType]]:
+    """确定可写出的 (连接, ROS 2 类型)，丢掉不认识的类型和同名冲突话题。
+
+    返回的目标类型经过 ``TYPE_ALIASES`` 改名，例如 livox_ros_driver 的
+    ``CustomMsg`` 会以 ``livox_ros_driver2/msg/CustomMsg`` 写出。
+    """
+    resolvable: list[tuple[Connection, MsgType]] = []
     for conn in connections:
+        out_type: MsgType = TYPE_ALIASES.get(conn.msgtype, conn.msgtype)
         try:
-            ros2_store.generate_msgdef(conn.msgtype, ros_version=2)
+            ros2_store.generate_msgdef(out_type, ros_version=2)
         except TypesysError as exc:
             LOGGER.warning(
                 "skipping %s: %s (use --register to add the definition)",
@@ -157,21 +224,21 @@ def resolve_connections(connections, ros2_store):
                 exc,
             )
             continue
-        resolvable.append(conn)
+        resolvable.append((conn, out_type))
 
-    kept: dict[str, object] = {}
-    for conn in resolvable:
+    kept: dict[str, tuple[Connection, MsgType]] = {}
+    for conn, out_type in resolvable:
         previous = kept.get(conn.topic)
         if previous is not None:
             LOGGER.warning(
                 "topic %s appears twice (%s, %s); keeping %s",
                 conn.topic,
-                previous.msgtype,
-                conn.msgtype,
-                previous.msgtype,
+                previous[1],
+                out_type,
+                previous[1],
             )
             continue
-        kept[conn.topic] = conn
+        kept[conn.topic] = (conn, out_type)
     return list(kept.values())
 
 
@@ -179,9 +246,9 @@ def convert(
     src: Path,
     dest: Path,
     *,
-    ros2_store,
-    types,
-    topics,
+    ros2_store: Typestore,
+    types: Collection[MsgType] | None,
+    topics: Collection[str] | None,
     progress: bool = True,
 ) -> int:
     """执行转换，返回进程退出码。"""
@@ -198,8 +265,8 @@ def convert(
             for topic, msgtype in sorted(skipped.items()):
                 LOGGER.info("skipping %s (%s): type not selected", topic, msgtype)
 
-            connections = resolve_connections(connections, ros2_store)
-            if not connections:
+            targets = resolve_connections(connections, ros2_store)
+            if not targets:
                 LOGGER.error("no convertible topics in %s", src)
                 if skipped:
                     LOGGER.error(
@@ -209,21 +276,25 @@ def convert(
                     )
                 return EXIT_FAILED
 
-            total = sum(conn.msgcount for conn in connections)
-            for conn in connections:
+            total: int = sum(conn.msgcount for conn, _ in targets)
+            out_types: dict[int, MsgType] = {
+                conn.id: out_type for conn, out_type in targets
+            }
+            for conn, out_type in targets:
                 LOGGER.info(
-                    "converting %s (%s, %d messages)",
+                    "converting %s (%s -> %s, %d messages)",
                     conn.topic,
                     conn.msgtype,
+                    out_type,
                     conn.msgcount,
                 )
 
             try:
                 with Writer(dest, version=Writer.VERSION_LATEST) as writer:
-                    out = {}
-                    for conn in connections:
+                    out: dict[int, Connection] = {}
+                    for conn, out_type in targets:
                         out[conn.id] = writer.add_connection(
-                            conn.topic, conn.msgtype, typestore=ros2_store
+                            conn.topic, out_type, typestore=ros2_store
                         )
                     with tqdm(
                         total=total,
@@ -231,12 +302,13 @@ def convert(
                         unit="msg",
                         disable=not progress,
                     ) as bar:
-                        for conn, timestamp, rawdata in reader.messages(connections):
-                            msg = reader.deserialize(rawdata, conn.msgtype)
+                        messages: Iterable[RawMessage] = reader.messages(connections)
+                        for conn, timestamp, rawdata in messages:
+                            msg: Any = reader.deserialize(rawdata, conn.msgtype)
                             writer.write(
                                 out[conn.id],
                                 timestamp,
-                                ros2_store.serialize_cdr(msg, conn.msgtype),
+                                ros2_store.serialize_cdr(msg, out_types[conn.id]),
                             )
                             bar.update(1)
             except BaseException:
@@ -251,9 +323,9 @@ def convert(
     return EXIT_OK
 
 
-def main(argv=None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """命令行入口，返回进程退出码。"""
-    args = build_parser().parse_args(argv)
+    args: argparse.Namespace = build_parser().parse_args(argv)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -272,7 +344,8 @@ def main(argv=None) -> int:
             return EXIT_USAGE
         shutil.rmtree(dest)
 
-    ros2_store = get_typestore(DISTROS[args.distro])
+    ros2_store: Typestore = get_typestore(DISTROS[args.distro])
+    register_bundled_types(ros2_store)
     try:
         register_types(ros2_store, args.register)
     except (ValueError, OSError) as exc:
