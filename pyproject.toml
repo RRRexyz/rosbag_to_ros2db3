@@ -1,14 +1,15 @@
 [project]
 name = "rosbag-to-ros2db3"
 version = "0.1.0"
-description = "Add your description here"
+description = "把 ROS 1 bag 包转换为 ROS 2 rosbag2 (db3) 格式"
 readme = "README.md"
 authors = [
     { name = "Rexyz", email = "2840722773@qq.com" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.10"
 dependencies = [
     "rosbags>=0.11.9",
+    "tqdm>=4.70.1",
 ]
 
 [project.scripts]
