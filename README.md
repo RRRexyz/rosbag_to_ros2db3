@@ -32,6 +32,7 @@ bagcon drive.bag --all-types                      # 转 typestore 已知的全�
 | `--distro` | 用哪个 ROS 2 版本的消息定义，默认 `foxy` |
 | `--register TYPE=PATH` | 为自定义类型注册 `.msg` 定义，可重复 |
 | `--no-progress` | 关闭进度条，适合脚本和日志 |
+| `--keep-invalid-timestamps` | 保留时间戳早于 2000-01-01 的消息（默认丢弃） |
 
 默认只转换 `sensor_msgs/msg/CompressedImage`、`sensor_msgs/msg/Imu` 和
 `livox_ros_driver/msg/CustomMsg`，其余话题会被跳过并打日志说明。
@@ -39,6 +40,20 @@ bagcon drive.bag --all-types                      # 转 typestore 已知的全�
 退出码：`0` 成功、`1` 转换失败、`2` 参数或路径有问题。
 
 转换是逐条流式写入的，内存占用与包大小无关，几 GB 的包也能转。
+
+## 时间戳校验
+
+有些采集程序会在包开头写入几条时间戳为 0（1970 年）、内容为空的帧（常见于 Livox 雷达）。
+这类消息一旦写进 rosbag2，整包的 `starting_time` 就被拉到 1970 年，`ros2 bag play` 会先空等
+几十年才发布第一条数据。
+
+转换默认把时间戳早于 **2000-01-01** 的消息整条丢弃，并按话题打印丢弃条数：
+
+```
+[WARNING] dropped 4 message(s) from /livox/lidar: timestamp before 2000-01-01
+```
+
+确实需要原样保留（比如要排查原始数据）时加 `--keep-invalid-timestamps`。
 
 ## Livox 激光雷达
 

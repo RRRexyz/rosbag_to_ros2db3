@@ -10,6 +10,10 @@
 半成品输出目录，避免下一次运行被残留目录挡住，也避免留下"看起来正常、
 实际只有一半消息"的 bag。
 
+时间戳早于 2000-01-01 的消息默认丢弃：有些采集程序会在包开头写入时间戳为 0
+的空帧，留着会把 rosbag2 的起始时间拉到 1970 年，播放时要空等几十年。
+``--keep-invalid-timestamps`` 可以保留这些消息。
+
 livox_ros_driver 只有 ROS 1 版本，对应的 ROS 2 驱动改名为 livox_ros_driver2，
 消息定义字段一致但类型名不同。包里遇到 ``livox_ros_driver/msg/CustomMsg`` 时
 会按 ``livox_ros_driver2/msg/CustomMsg`` 写出（定义随包分发，见 ``BUNDLED_TYPES``），
@@ -91,6 +95,12 @@ EXIT_FAILED = 1
 EXIT_USAGE = 2
 EXIT_INTERRUPTED = 130
 
+#: 时间戳早于此值的消息视为无效（2000-01-01T00:00:00Z）。
+#: 有些采集程序会在包开头写入时间戳为 0（1970 年）、内容为空的帧，
+#: 这类消息会把 rosbag2 的起始时间拉到 1970 年，播放时要空等几十年，
+#: 所以默认丢弃；``--keep-invalid-timestamps`` 可以关掉这个过滤。
+MIN_VALID_TIMESTAMP_NS: int = 946_684_800_000_000_000
+
 
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行参数解析器。"""
@@ -149,6 +159,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-progress",
         action="store_true",
         help="disable the progress bar (useful for logs and automation)",
+    )
+    parser.add_argument(
+        "--keep-invalid-timestamps",
+        action="store_true",
+        help=(
+            "keep messages whose timestamp is before 2000-01-01 "
+            "(dropped by default: they drag the bag start back to 1970 "
+            "and make playback wait)"
+        ),
     )
     return parser
 
@@ -250,8 +269,13 @@ def convert(
     types: Collection[MsgType] | None,
     topics: Collection[str] | None,
     progress: bool = True,
+    drop_invalid: bool = True,
 ) -> int:
-    """执行转换，返回进程退出码。"""
+    """执行转换，返回进程退出码。
+
+    ``drop_invalid`` 为真时丢弃时间戳早于 ``MIN_VALID_TIMESTAMP_NS`` 的消息，
+    并逐个话题打印丢弃条数。
+    """
     try:
         with AnyReader(
             [src], default_typestore=get_typestore(ROS1_TYPESTORE)
@@ -296,6 +320,8 @@ def convert(
                         out[conn.id] = writer.add_connection(
                             conn.topic, out_type, typestore=ros2_store
                         )
+                    dropped: dict[str, int] = {}
+                    written: int = 0
                     with tqdm(
                         total=total,
                         desc="converting",
@@ -304,13 +330,27 @@ def convert(
                     ) as bar:
                         messages: Iterable[RawMessage] = reader.messages(connections)
                         for conn, timestamp, rawdata in messages:
+                            if drop_invalid and timestamp < MIN_VALID_TIMESTAMP_NS:
+                                dropped[conn.topic] = (
+                                    dropped.get(conn.topic, 0) + 1
+                                )
+                                bar.update(1)
+                                continue
                             msg: Any = reader.deserialize(rawdata, conn.msgtype)
                             writer.write(
                                 out[conn.id],
                                 timestamp,
                                 ros2_store.serialize_cdr(msg, out_types[conn.id]),
                             )
+                            written += 1
                             bar.update(1)
+
+                for topic in sorted(dropped):
+                    LOGGER.warning(
+                        "dropped %d message(s) from %s: timestamp before 2000-01-01",
+                        dropped[topic],
+                        topic,
+                    )
             except BaseException:
                 # 失败时清掉半成品，避免下次运行撞上"目录已存在"
                 shutil.rmtree(dest, ignore_errors=True)
@@ -319,7 +359,7 @@ def convert(
         LOGGER.error("%s", exc)
         return EXIT_FAILED
 
-    LOGGER.info("wrote %s (%d messages)", dest, total)
+    LOGGER.info("wrote %s (%d messages)", dest, written)
     return EXIT_OK
 
 
@@ -360,6 +400,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             types=None if args.all_types else DEFAULT_TYPES,
             topics=set(args.topics) if args.topics else None,
             progress=not args.no_progress,
+            drop_invalid=not args.keep_invalid_timestamps,
         )
     except KeyboardInterrupt:
         LOGGER.error("interrupted, removed %s", dest)
