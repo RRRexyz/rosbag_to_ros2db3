@@ -18,6 +18,12 @@ livox_ros_driver 只有 ROS 1 版本，对应的 ROS 2 驱动改名为 livox_ros
 消息定义字段一致但类型名不同。包里遇到 ``livox_ros_driver/msg/CustomMsg`` 时
 会按 ``livox_ros_driver2/msg/CustomMsg`` 写出（定义随包分发，见 ``BUNDLED_TYPES``），
 这样 ROS 2 侧的 livox_ros_driver2 和配套 rviz 插件可以直接读。
+
+部分 Livox 录制里单帧内部的 ``offset_time`` 会往回跳：点按 96 个一包拼接，
+包内时间严格递增，但包与包之间的时间戳抖动很大，后一包的起点可能早于前一包的
+终点。这是录制端的时间戳问题（livox_ros_driver2 1.2.1 修过 CustomMsg 的
+offset time），转换只能原样搬运。``--sort-points`` 会把每帧的点按 ``offset_time``
+稳定排序，让帧内时间单调，点的时刻本身不变。
 """
 
 # pyright: reportAttributeAccessIssue=false
@@ -25,13 +31,14 @@ livox_ros_driver 只有 ROS 1 版本，对应的 ROS 2 驱动改名为 livox_ros
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import shutil
 import sys
 from collections.abc import Collection, Iterable, Sequence
 from importlib.resources import files
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from rosbags.highlevel import AnyReader
 from rosbags.interfaces import Connection
@@ -68,11 +75,14 @@ BUNDLED_TYPES: tuple[tuple[MsgType, tuple[str, ...]], ...] = (
 )
 
 #: 默认转换的消息类型，用 ``--all-types`` 放开到 typestore 已知的全部类型。
+#: livox 两个包名都收：ROS 1 原始数据是 ``livox_ros_driver``，从 ROS 2 转回来的
+#: 包则可能已经是 ``livox_ros_driver2``，后者的类型名原样写出、不做改名。
 DEFAULT_TYPES: frozenset[MsgType] = frozenset(
     {
         "sensor_msgs/msg/CompressedImage",
         "sensor_msgs/msg/Imu",
         "livox_ros_driver/msg/CustomMsg",
+        "livox_ros_driver2/msg/CustomMsg",
     }
 )
 
@@ -110,7 +120,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "livox_ros_driver/msg/CustomMsg is written as "
             "livox_ros_driver2/msg/CustomMsg, because the ROS 2 Livox driver "
-            "uses the livox_ros_driver2 package name."
+            "uses the livox_ros_driver2 package name; bags that already carry "
+            "livox_ros_driver2/msg/CustomMsg keep that type name."
         ),
     )
     parser.add_argument("src", type=Path, help="path to the ROS 1 .bag file")
@@ -169,6 +180,15 @@ def build_parser() -> argparse.ArgumentParser:
             "and make playback wait)"
         ),
     )
+    parser.add_argument(
+        "--sort-points",
+        action="store_true",
+        help=(
+            "stable-sort the points of every Livox CustomMsg by offset_time, "
+            "so the per-frame times are monotonic (some recordings have "
+            "jittery packet timestamps that make offset_time jump backwards)"
+        ),
+    )
     return parser
 
 
@@ -203,6 +223,24 @@ def register_bundled_types(store: Typestore) -> None:
             LOGGER.warning("bundled definition for %s is missing: %s", typename, exc)
             continue
         store.register(get_types_from_msg(text, typename))
+
+
+def sort_points_by_offset(msg: Any) -> Any:
+    """把一帧内的点按 ``offset_time`` 稳定排序，返回新的消息对象。
+
+    只处理带 ``points`` 列表、且点上有 ``offset_time`` 字段的消息（Livox
+    CustomMsg 就是这种）；其它消息原样返回。排序不改变任何点的时刻，只改
+    顺序，因此帧内 ``offset_time`` 变成单调递增。
+    """
+    points = getattr(msg, "points", None)
+    if not isinstance(points, list) or len(points) < 2:
+        return msg
+    if not all(hasattr(point, "offset_time") for point in points):
+        return msg
+    if not dataclasses.is_dataclass(msg):
+        return msg
+    ordered = sorted(points, key=lambda point: point.offset_time)
+    return dataclasses.replace(cast("Any", msg), points=ordered)
 
 
 def select_connections(
@@ -270,11 +308,13 @@ def convert(
     topics: Collection[str] | None,
     progress: bool = True,
     drop_invalid: bool = True,
+    sort_points: bool = False,
 ) -> int:
     """执行转换，返回进程退出码。
 
     ``drop_invalid`` 为真时丢弃时间戳早于 ``MIN_VALID_TIMESTAMP_NS`` 的消息，
-    并逐个话题打印丢弃条数。
+    并逐个话题打印丢弃条数。``sort_points`` 为真时对每个 Livox CustomMsg
+    按 ``offset_time`` 排序，保证帧内点时间单调。
     """
     try:
         with AnyReader(
@@ -337,6 +377,8 @@ def convert(
                                 bar.update(1)
                                 continue
                             msg: Any = reader.deserialize(rawdata, conn.msgtype)
+                            if sort_points:
+                                msg = sort_points_by_offset(msg)
                             writer.write(
                                 out[conn.id],
                                 timestamp,
@@ -401,6 +443,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             topics=set(args.topics) if args.topics else None,
             progress=not args.no_progress,
             drop_invalid=not args.keep_invalid_timestamps,
+            sort_points=args.sort_points,
         )
     except KeyboardInterrupt:
         LOGGER.error("interrupted, removed %s", dest)

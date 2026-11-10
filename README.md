@@ -33,9 +33,11 @@ bagcon drive.bag --all-types                      # 转 typestore 已知的全�
 | `--register TYPE=PATH` | 为自定义类型注册 `.msg` 定义，可重复 |
 | `--no-progress` | 关闭进度条，适合脚本和日志 |
 | `--keep-invalid-timestamps` | 保留时间戳早于 2000-01-01 的消息（默认丢弃） |
+| `--sort-points` | 把每个 Livox CustomMsg 里的点按 `offset_time` 排序，保证帧内时间单调 |
 
-默认只转换 `sensor_msgs/msg/CompressedImage`、`sensor_msgs/msg/Imu` 和
-`livox_ros_driver/msg/CustomMsg`，其余话题会被跳过并打日志说明。
+默认只转换 `sensor_msgs/msg/CompressedImage`、`sensor_msgs/msg/Imu` 和两种 Livox
+`CustomMsg`（`livox_ros_driver/msg/CustomMsg`、`livox_ros_driver2/msg/CustomMsg`），其余话题会被
+跳过并打日志说明。
 
 退出码：`0` 成功、`1` 转换失败、`2` 参数或路径有问题。
 
@@ -70,6 +72,29 @@ bagcon hall01.bag -t /livox/lidar -o hall01_ros2
 `livox_ros_driver2` 的 `.msg` 定义随包分发（`src/rosbag_to_ros2db3/msg/livox_ros_driver2/msg/`），
 不需要另外装驱动包，也不需要 `--register`。取 ROS 1 bag 里内嵌的定义反序列化，再按 ROS 2 的定义
 写 CDR，所以 `Header.seq` 会按格式差异丢掉，其余字段不变。
+
+如果包里的类型**本来就是** `livox_ros_driver2/msg/CustomMsg`（例如从 ROS 2 转回 ROS 1 的包），
+转换时类型名原样保留，不做任何改名。
+
+### 帧内 `offset_time` 回跳
+
+部分录制里，同一帧的点时间并不单调：点的 `offset_time` 在帧内会往回跳几百微秒。这不是转换
+引入的——源 bag 里就是如此。典型成因是录制端 Livox 驱动给每个数据包打的时间戳抖动较大
+（`livox_ros_driver2` 在 1.2.1 版修过 CustomMsg 的 offset time），转换只是原样搬运。
+
+实际数据长这样：每帧由 96 个一包的点组成（每包内间隔恒定为几微秒），但包与包之间的起点
+时间会前后错开，于是拼接后出现回跳。单帧 2 万个点里大约 130 处回跳，最大约 0.45 ms。
+
+对建图的影响通常很小：每个点仍然带自己的 `offset_time`，FAST-LIO2、Point-LIO 这类按点
+时间做去畸变的算法不要求点按时间排序。但如果下游代码假设"点按时间递增"（例如用相邻点
+时间差计算速度、二分查找、按时间做 range image 分箱），负的时间差会出问题。
+
+需要单调时间时加 `--sort-points`：对每帧的点按 `offset_time` 稳定排序，点的时刻、坐标、
+属性都不改，只是顺序变了。默认不开，保证输出与源包逐点同序。
+
+```bash
+bagcon 大礼堂.bag -t /livox/lidar --sort-points
+```
 
 ## 自定义消息类型
 
